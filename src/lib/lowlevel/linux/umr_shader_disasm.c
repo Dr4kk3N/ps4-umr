@@ -1,0 +1,209 @@
+/*
+ * Copyright (c) 2025 Advanced Micro Devices, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * Authors: Tom St Denis <tom.stdenis@amd.com>
+ *
+ */
+#include "umr.h"
+
+#ifndef UMR_NO_LLVM
+#include <llvm-c/Disassembler.h>
+#include <llvm-c/Target.h>
+
+/**
+ * @brief Disassemble a shader program.
+ *
+ * This function takes a shader program and disassembles it into human-readable form.
+ * The disassembled instructions are stored in an array of strings, which is allocated
+ * by this function and must be freed by the caller.
+ *
+ * @param asic         Pointer to the UMR ASIC structure representing the GPU.
+ * @param inst         Pointer to the shader program bytes.
+ * @param inst_bytes   Number of bytes in the shader program.
+ * @param PC           Shader address in virtual memory.
+ * @param disasm_text  Output parameter: array of pointers to disassembled shader instructions.
+ *
+ * @return             0 on success, -1 on failure (e.g., out of memory).
+ */
+int umr_shader_disasm(struct umr_asic *asic,
+		     uint8_t *inst, unsigned inst_bytes,
+		     uint64_t PC,
+		     char ***disasm_text)
+{
+	LLVMDisasmContextRef disasm_ref;
+	unsigned x, z, i;
+	int maj, min;
+	size_t n;
+	char tmp[256], *cpuname, *features;
+
+	if (umr_gfx_get_ip_ver(asic, &maj, &min) < 0 || maj < 8) {
+		// LLVM disassembly not supported for older targets.
+		return 0;
+	}
+
+	*disasm_text = calloc(inst_bytes/4, sizeof(**disasm_text));
+	if (!*disasm_text) {
+		asic->err_msg("[ERROR]: Out of memory\n");
+		return -1;
+	}
+
+	if (asic->options.no_disasm) {
+		for (x = 0; x < inst_bytes; x += 4) {
+			(*disasm_text)[x/4] = strdup("...");
+		}
+		return 0;
+	}
+
+	// initialize LLVM
+	LLVMInitializeAllTargetInfos();
+	LLVMInitializeAllTargetMCs();
+	LLVMInitializeAllDisassemblers();
+
+	// cpuname based on mesa usage
+	cpuname = asic->asicname;
+	if (!strcmp(cpuname, "raven1") || !strcmp(cpuname, "picasso"))
+		cpuname = "gfx902";
+	else if (!strcmp(cpuname, "polaris12") || !strcmp(cpuname, "vegam"))
+		cpuname = "polaris11";
+	else if (!strcmp(cpuname, "vega12"))
+		cpuname = "gfx904";
+	else if (!strcmp(cpuname, "vega20"))
+		cpuname = "gfx906";
+	else if (!strcmp(cpuname, "arcturus"))
+		cpuname = "gfx908";
+	else if (!strcmp(cpuname, "renoir"))
+		cpuname = "gfx909";
+	else if (!strcmp(cpuname, "aldebaran"))
+		cpuname = "gfx90a";
+	else if (!strcmp(cpuname, "navi10"))
+		cpuname = "gfx1010";
+	else if (!strcmp(cpuname, "navi12"))
+		cpuname = "gfx1011";
+	else if (!strcmp(cpuname, "navi14"))
+		cpuname = "gfx1012";
+	else if (!strcmp(cpuname, "sienna_cichlid") || !strcmp(cpuname, "navy_flounder") || !strcmp(cpuname, "dimgrey_cavefish") ||
+			 !strcmp(cpuname, "vangogh"))
+		cpuname = "gfx1030";
+	else if (asic->family > FAMILY_VI && asic->family < FAMILY_NV)
+		cpuname = "gfx900";
+	else if (asic->family >= FAMILY_NV)
+		cpuname = "gfx1010";
+
+	struct umr_ip_block* gfx = umr_find_ip_block(asic, "gfx", asic->options.vm_partition);
+	if (gfx) {
+		if (gfx->discoverable.maj == 11) {
+			switch (gfx->discoverable.rev) {
+				case 0:
+					cpuname = "gfx1100";
+					break;
+				case 1:
+					cpuname = "gfx1101";
+					break;
+				case 2:
+					cpuname = "gfx1102";
+					break;
+				case 3:
+					cpuname = "gfx1103";
+					break;
+			}
+		} else if (gfx->discoverable.maj == 12) {
+			switch (gfx->discoverable.rev) {
+				case 0:
+					cpuname = "gfx1200";
+					break;
+				case 1:
+					cpuname = "gfx1201";
+					break;
+			}
+		}
+	}
+
+	// compute features
+	features = "";
+	if (asic->family >= FAMILY_NV && asic->options.wave64)
+		features = "+wavefrontsize64";
+
+	disasm_ref = LLVMCreateDisasmCPUFeatures(
+			"amdgcn-mesa-mesa3d", cpuname, features, NULL, 0,
+			NULL, NULL);
+
+	if (!disasm_ref) {
+		asic->err_msg("[ERROR]:  Could not create disassembler context\n");
+		free(*disasm_text);
+		return -1;
+	}
+
+	for (i = x = 0; x < inst_bytes; x += n) {
+		n = LLVMDisasmInstruction(
+				disasm_ref,
+				inst + x, inst_bytes - x,
+				PC + x,
+				tmp, sizeof(tmp));
+		if (!n) {
+			// invalid instruction, skip 4 bytes
+			n = 4;
+			(*disasm_text)[i++] = strdup("...");
+		} else {
+			// valid instruction
+
+			// if the instruction is longer than 4 bytes
+			// then add ';;' to all but the first line
+			(*disasm_text)[i++] = strdup(tmp);
+			for (z = 4; z < n; z += 4)
+				(*disasm_text)[i++] = strdup(";;");
+		}
+	}
+
+	LLVMDisasmDispose(disasm_ref);
+	return 0;
+}
+
+#else
+
+/**
+ * umr_shader_disasm - Diassemble a shader
+ *
+ * @inst:  Shader program
+ * @inst_bytes: number of bytes in shader
+ * @PC:  Shader address in virtual memory
+ * @disasm_text:	array of pointers that are assigned pointers
+ *					to disassembled shader.
+ */
+int umr_shader_disasm(struct umr_asic *asic,
+		     uint8_t *inst, unsigned inst_bytes,
+		     uint64_t PC,
+		     char ***disasm_text)
+{
+	unsigned x;
+
+	*disasm_text = calloc(inst_bytes/4, sizeof(**disasm_text));
+	if (!*disasm_text) {
+		asic->err_msg("[ERROR]: Out of memory\n");
+		return -1;
+	}
+
+	for (x = 0; x < inst_bytes; x += 4) {
+		(*disasm_text)[x/4] = strdup("...");
+	}
+	return 0;
+}
+
+#endif
